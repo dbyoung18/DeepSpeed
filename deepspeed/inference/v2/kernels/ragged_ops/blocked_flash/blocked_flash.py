@@ -16,6 +16,8 @@ def get_q_block_size(head_size: int) -> int:
     """
     Returns the query block size required by the kernel given a head size.
     """
+    if get_accelerator().device_name() == "xpu":
+        return 64
     cc_major, cc_minor = torch.cuda.get_device_capability(get_accelerator().current_device())  #ignore-cuda
 
     if cc_major < 8:
@@ -46,6 +48,8 @@ def get_kv_block_size(head_size: int) -> int:
     """
     Return preferred granulatity for blocked KV-cache implementation.
     """
+    if get_accelerator().device_name() == "xpu":
+        return 64
     cc_major, cc_minor = torch.cuda.get_device_capability(get_accelerator().current_device())  #ignore-cuda
 
     if cc_major < 8:

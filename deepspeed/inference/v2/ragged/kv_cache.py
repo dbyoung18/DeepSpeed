@@ -95,10 +95,10 @@ class BlockedKVCache:
                 dist.all_reduce(dummy_tensor, op=ReduceOp.MIN, group=mp_group)
 
             get_accelerator().empty_cache()
-            available_kv_memory = get_accelerator().available_memory() - self._memory_config.size
+            available_kv_memory = get_accelerator().available_memory() * 0.9 - self._memory_config.size
             total_memory = get_accelerator().total_memory()
 
-            inference_logger().debug(
+            inference_logger().info(
                 f"Memory usage before KV-cache allocation: total_memory={total_memory}, available_kv_memory={available_kv_memory}, total_per_block_footprint={total_per_block_footprint}"
             )
 
@@ -127,6 +127,7 @@ class BlockedKVCache:
 
         caches = []
         allocators = []
+        num_blocks = int(num_blocks)
 
         for cache_group_id, config in enumerate(self._configs):
             num_caches = config.cache_shape[0]

@@ -8,6 +8,8 @@ from typing import Any, Dict, Optional
 import torch
 
 from deepspeed.accelerator import get_accelerator
+if get_accelerator().device_name() == "xpu":
+    import intel_extension_for_pytorch as ipex
 from ....allocator import empty_from
 from ....inference_utils import DtypeEnum
 from ....kernels.ragged_ops import (
@@ -110,11 +112,11 @@ class DSDenseBlockedAttention(DSSelfAttentionBase):
         self.model_dim = self._config.head_size * self._config.n_heads_q
         self._output = torch.empty((self._config.max_tokens, self._config.head_size * self._config.n_heads_q),
                                    dtype=self._config.output_dtype,
-                                   device=get_accelerator().current_device())
+                                   device=get_accelerator().current_device_name())
 
         # TODO(cmikeh2): Pre-allocate storage buffer for the attention atoms.
         self._max_atoms = self._config.max_sequences
-        self._atoms = torch.empty((self._max_atoms, 8), dtype=torch.int32, device=get_accelerator().current_device())
+        self._atoms = torch.empty((self._max_atoms, 8), dtype=torch.int32, device=get_accelerator().current_device_name())
 
         alloc_func = RaggedUtilsBuilder().load().allocate_fast_host_buffer
         self._atoms_shadow = alloc_func(self._atoms)
@@ -143,11 +145,89 @@ class DSDenseBlockedAttention(DSSelfAttentionBase):
         Args:
             ragged_batch (RaggedBatchWrapper): The input ids and associated ragged batch metadata.
         """
+        if get_accelerator().device_name() == "xpu":
+            return
+
         host_atoms, n_atoms = self._atom_builder(self._atoms_shadow, ragged_batch, self.q_block_size,
-                                                 self.kv_block_size)
+                                                self.kv_block_size)
 
         self._cur_atoms = n_atoms
         self._atoms[:n_atoms].copy_(host_atoms[:n_atoms], non_blocking=True)
+
+    def ref_BlockedFlashAttn(self, q, k, v, ragged_batch, softmax_scale):
+        """
+        Args:
+            q (torch.Tensor): Query tensor of shape [tokens, hidden_size]
+            k (torch.Tensor): Key cache tensor of shape [n_blocks, block_size, n_heads_kv, head_size]. This Tensor only needs to be contiguous on the final dimension.
+            v (torch.Tensor): Value cache tensor of shape [n_blocks, block_size, n_heads_kv, head_size]. This Tensor only needs to be contiguous on the final dimension.
+            atoms (torch.Tensor): Atom information tensor of shape [num_atoms, 8] and type int32.
+                Not all data is readable in this format. See attention_atom.h for further details.
+            softmax_scale (float): Softmax scale factor.
+        """
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+
+        num_head_k = k.shape[2]
+        head_size = k.shape[3]
+        num_head = q.shape[-1] // head_size
+        kv_block_size = k.shape[1]
+        batch_data = ragged_batch.batch_metadata_buffer(on_device=False)
+        seq_data = ragged_batch.inflight_seq_descriptors(on_device=False)
+        kv_ptr_list = ragged_batch.kv_buffer()
+        batch_size = batch_data[1]
+        q_seq_lens = torch.tensor([0] * batch_size)
+        kv_seq_lens = torch.tensor([0] * batch_size)
+        max_seqlen_q = 0
+        max_seqlen_kv = 0
+
+        # get sequence infomation
+        # TODO: use start_idx here???
+        for seq_id in range(batch_size):
+            # start_idx = seq_data[seq_id][0]
+            num_tokens = seq_data[seq_id][1]
+            seen_tokens = seq_data[seq_id][2]
+            q_seq_lens[seq_id] = num_tokens
+            kv_seq_lens[seq_id] = num_tokens + seen_tokens
+            max_seqlen_q = max(max_seqlen_q, num_tokens)
+            max_seqlen_kv = max(max_seqlen_kv, num_tokens + seen_tokens)
+
+        pad_q = torch.zeros([batch_size, max_seqlen_q, num_head, head_size], dtype=q.dtype, device=q.device)
+        pad_k = torch.zeros([batch_size, max_seqlen_kv, num_head_k, head_size], dtype=k.dtype, device=k.device)
+        pad_v = torch.zeros([batch_size, max_seqlen_kv, num_head_k, head_size], dtype=v.dtype, device=v.device)
+
+        # construting inputs for SDP in ipex
+        q_mask = torch.arange(0, max_seqlen_q)[None, :].repeat(batch_size, 1)
+        q_mask = q_mask < q_seq_lens[:, None].repeat(1, q_mask.size(-1))
+        pad_q[q_mask] = torch.reshape(q, [-1, num_head, head_size])
+        for seq_id in range(batch_size):
+            kv_length = kv_seq_lens[seq_id]
+            kv_blocks = (kv_length + kv_block_size - 1) // kv_block_size
+            kv_block_table = kv_ptr_list[seq_id][0]
+            for block_id in range(kv_blocks):
+                cur_length = min(kv_block_size, kv_length - block_id * kv_block_size)
+                pad_k[seq_id, :cur_length, :, :] = k[kv_block_table[block_id], :cur_length, :, :]
+                pad_v[seq_id, :cur_length, :, :] = v[kv_block_table[block_id], :cur_length, :, :]
+
+        pad_q = pad_q.permute(0, 2, 1, 3)
+        pad_k = pad_k.permute(0, 2, 1, 3)
+        pad_v = pad_v.permute(0, 2, 1, 3)
+        k_mask = torch.arange(0, max_seqlen_kv)[None, :].repeat(batch_size, 1)
+        k_mask = k_mask < kv_seq_lens[:, None].repeat(1, k_mask.size(-1))
+        align_mask_seqlen = (max_seqlen_kv + 63) // 64 * 64
+        # attn_mask = torch.empty([batch_size, 1, 1, align_mask_seqlen], dtype=q.dtype).fill_(float("-inf"))
+        # attn_mask[:, :, :, :max_seqlen_kv].masked_fill_(k_mask[:, None, None, :], 0)
+        # attn_mask = attn_mask.to(q.device)
+        assert not torch.any(pad_q.isnan()) and not torch.any(pad_q.isinf())
+        assert not torch.any(pad_k.isnan()) and not torch.any(pad_k.isinf())
+        assert not torch.any(pad_v.isnan()) and not torch.any(pad_v.isinf())
+        out_ = torch.ops.torch_ipex.xetla_fsdp_forward_atten_mask_alibi_strided(
+                pad_q, pad_k, pad_v, None, None, None, softmax_scale, 1.0, 0.0, True, False)
+        out_ = out_.permute(0, 2, 1, 3)
+        out = out_[q_mask]
+        out = out.reshape(out.shape[0],  -1)
+        assert not torch.any(out.isnan()) and not torch.any(out.isinf())
+        return out
 
     def forward(self,
                 q_k_v: torch.Tensor,
@@ -175,6 +255,9 @@ class DSDenseBlockedAttention(DSSelfAttentionBase):
         output = empty_from(self._output, q.shape)
         k_cache, v_cache = split_kv(kv_cache)
 
-        self._attn_kernel(output, q, k_cache, v_cache, self._atoms[:self._cur_atoms], self._softmax_scale)
+        if get_accelerator().device_name() == "cuda":
+            self._attn_kernel(output, q, k_cache, v_cache, self._atoms[:self._cur_atoms], self._softmax_scale)
+        else:
+            output = self.ref_BlockedFlashAttn(q, k_cache, v_cache, batch, self._softmax_scale)
 
         return output

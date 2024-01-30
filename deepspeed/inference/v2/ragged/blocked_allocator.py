@@ -3,6 +3,7 @@
 
 # DeepSpeed Team
 
+from deepspeed.accelerator import get_accelerator
 from typing import Iterable, Union
 
 import torch
@@ -43,7 +44,8 @@ class BlockedAllocator:
             raise ValueError(f'Blocked KV-cache must have at least 1 block, provided {num_blocks}')
 
         self._num_blocks = num_blocks
-        self._blocks = torch.arange(1, num_blocks + 1, dtype=torch.int32, device='cpu', pin_memory=False)
+        self._blocks = torch.arange(1, num_blocks + 1, dtype=torch.int32, device='cpu')
+        self._blocks = self._blocks.pin_memory(get_accelerator().device_name())
         self._head = 0
         self._free_blocks = num_blocks
 

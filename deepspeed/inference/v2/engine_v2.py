@@ -79,9 +79,9 @@ class InferenceEngineV2:
         self._base_mp_group = self._initialize_tp_group()
 
         # Build model from policy
+        self.use_v1 = False
         inference_logger().info("Building model...")
-        if get_accelerator().device_name() == "xpu":
-            # TODO: convert V1 Engine to V2 Model
+        if get_accelerator().device_name() == "xpu" and self.use_v1:
             from .model_implementations.xpu_model_base import XPUModel
             self._model = XPUModel(self._config, self._policy, self._base_mp_group)
             self._model.build_model()
@@ -146,7 +146,8 @@ class InferenceEngineV2:
 
         # Prep all data structures for the actual forward (in anticipation of CG in the future)
         # and also to amortize some of the costs in a more straightforward way.
-        self._model.prepare_batch(self._batch, token_lens)
+        # self._model.prepare_batch(self._batch, token_lens)
+        self._model.prepare_batch(self._batch)
 
         # Model implementation will pick up in the forward.
         logits = self._model.forward(self._batch)
