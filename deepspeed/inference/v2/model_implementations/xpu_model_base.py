@@ -15,7 +15,7 @@ except Exception:
 import json
 import os
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import torch
 from huggingface_hub import snapshot_download
@@ -133,6 +133,7 @@ class XPUModel(DSTransformerModelBase, Module):
         self.dtype = kwargs.get("dtype", "float16")
         self._parse_dtype(self.dtype)
         self.model: Module = None
+        self.paged: bool = True
 
     def _parse_dtype(self, dtype="float16"):
         if dtype == "float16":
@@ -326,25 +327,46 @@ class XPUModel(DSTransformerModelBase, Module):
             )
         return (self._kv_cache_config, )
 
-    def prepare_batch(self, wrapped_batch: RaggedBatchWrapper) -> None:
-        pass
+    def prepare_batch(
+            self,
+            wrapped_batch: RaggedBatchWrapper,
+            token_lens: List[int],
+            padding_side: str = "right"
+        ) -> None:
+        # packed input -> batched input
+        max_len = max(token_lens)
+        input_ids = torch.zeros((len(token_lens), max_len), dtype=torch.int64)
+        position_ids = torch.zeros((len(token_lens), max_len), dtype=torch.int64)
+        for i, tokens in enumerate(wrapped_batch._batch_tokens):
+            token_len = token_lens[i]
+            if padding_side == "right":
+                input_ids[i, : token_len].copy_(tokens)
+                position_ids[i, : token_len].copy_(torch.arange(token_len))
+            else:
+                input_ids[i, max_len - token_len :].copy_(tokens)
+                position_ids[i, max_len - token_len :].copy_(torch.arange(token_len))
+        input_ids = input_ids.to(get_accelerator().device_name())
+        position_ids = position_ids.to(get_accelerator().device_name())
+        wrapped_batch.input_ids = input_ids
+        wrapped_batch.position_ids = position_ids
+        wrapped_batch.token_lens = token_lens
 
     """
     Forward implementations
     """
 
-    def _prepare_position_ids(self, wrapped_batch: RaggedBatchWrapper):
-        """
-        For each sequence in the batch, we store the start token in the batch, the number of tokens,
-        the number of tokens in the history of this sequence, and an unused 4th reserved for alignment.
-        For the above example this would give:
-        [[0, 4, H0, X], [4, 1, H1, X], [5, 3, H2, X]]
-        """
-        position_ids = []
-        for desc in wrapped_batch.inflight_seq_descriptors():
-            # [H0 ~ H0+4], [H1, H1+1], ...
-            position_ids.append(list(range(desc[2], desc[2] + desc[3])))
-        return torch.tensor(position_ids, device=get_accelerator().device_name(), dtype=torch.long)
+    # def _prepare_position_ids(self, wrapped_batch: RaggedBatchWrapper):
+    #     """
+    #     For each sequence in the batch, we store the start token in the batch, the number of tokens,
+    #     the number of tokens in the history of this sequence, and an unused 4th reserved for alignment.
+    #     For the above example this would give:
+    #     [[0, 4, H0, X], [4, 1, H1, X], [5, 3, H2, X]]
+    #     """
+    #     position_ids = []
+    #     for desc in wrapped_batch.inflight_seq_descriptors():
+    #         # [H0 ~ H0+4], [H1, H1+1], ...
+    #         position_ids.append(list(range(desc[2], desc[2] + desc[3])))
+    #     return torch.tensor(position_ids, device=get_accelerator().device_name(), dtype=torch.long)
 
     def _forward_embed(self, ragged_batch: RaggedBatchWrapper) -> torch.Tensor:
         """
@@ -356,7 +378,7 @@ class XPUModel(DSTransformerModelBase, Module):
         Returns:
             torch.Tensor: The embedded batch.
         """
-        embed = self.model.model.embed_tokens(ragged_batch.input_ids())
+        embed = self.model.model.embed_tokens(ragged_batch.input_ids)
 
         if embed.shape[-1] != self.model_dim:
             raise ValueError(f"Embedding output shape {embed.shape} does not match model_dim {self.model_dim}")
@@ -371,33 +393,38 @@ class XPUModel(DSTransformerModelBase, Module):
         return self.model.lm_head(hidden_states)
 
     def forward(self, wrapped_batch: RaggedBatchWrapper) -> torch.Tensor:
-        #model_kwargs = {}
-        #model_inputs = self.model.prepare_inputs_for_generation(wrapped_batch.input_ids(), **model_kwargs)
-        #model_outputs = self.model(**model_inputs)
-        input_ids = wrapped_batch.input_ids()
-        position_ids = self._prepare_position_ids(wrapped_batch)
-        hidden_states = self.model.model.embed_tokens(input_ids)
+        hidden_states = self._forward_embed(wrapped_batch)  # TODO: fix loading embed weight
 
         #all_hidden_states = () if output_hidden_states else None
         #all_self_attns = () if output_attentions else None
         next_decoder_cache = ()
         for idx, decoder_layer in enumerate(self.model.model.layers):
-            # actual(maybe): (num_blocks, config.block_size, 2, num_heads, head_size)
-            # expect: [2, num_blocks, num_heads, head_size, block_size]
-            kv_cache = self.state_manager.get_cache(idx)
-            layer_outputs = decoder_layer(
-                hidden_states,
-                position_ids=position_ids,
-                kv_cache=kv_cache,
-                block_tables=None,  # TODO: [num_seqs, max_blocks_per_seq]
-                slot_maps=None,  # [num_tokens] per kv token -> block_idx
-                input_length=None,  # TODO
-                max_seqlen=None,  # TODO
-                prompt_lens=None,  # TODO
-                use_cache=True,
-            )
-            hidden_states = layer_outputs[0]
-            next_decoder_cache += (layer_outputs[1], )
+            if self.paged:  # IPEX::PagedAttention(vLLM)
+                # actual(maybe): (num_blocks, config.block_size, 2, num_heads, head_size)
+                # expect: [2, num_blocks, num_heads, head_size, block_size]
+                layer_outputs = decoder_layer(
+                    hidden_states=hidden_states,
+                    position_ids=wrapped_batch.position_ids,
+                    kv_cache=self.state_manager.get_cache(idx),  #
+                    block_tables=torch.tensor(
+                        [],
+                        device=get_accelerator().current_device_name(),
+                        dtype=self.infer_dtype
+                    ),  # [num_seqs, max_blocks_per_seq]
+                    slot_maps=None,  # TODO: [num_tokens] per kv token -> block_idx
+                    input_length=torch.tensor(
+                        [],
+                        device=get_accelerator().current_device_name(),
+                        dtype=self.infer_dtype
+                    ),  #
+                    max_seqlen=0,  #
+                    prompt_lens=wrapped_batch.token_lens,
+                    use_cache=True,
+                )
+                hidden_states = layer_outputs[0]
+                next_decoder_cache += (layer_outputs[1], )
+            else:  # IPEX::fsdp
+                pass
 
         hidden_states = self.model.model.norm(hidden_states)
-        return self.model.lm_head(hidden_states)
+        return self._forward_unembed(hidden_states)

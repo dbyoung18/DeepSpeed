@@ -146,7 +146,7 @@ class InferenceEngineV2:
 
         # Prep all data structures for the actual forward (in anticipation of CG in the future)
         # and also to amortize some of the costs in a more straightforward way.
-        self._model.prepare_batch(self._batch)
+        self._model.prepare_batch(self._batch, token_lens)
 
         # Model implementation will pick up in the forward.
         logits = self._model.forward(self._batch)
