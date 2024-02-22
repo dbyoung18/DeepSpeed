@@ -36,7 +36,7 @@ class BlasFPLinear(DSLinearBase):
         if config.input_dtype != config.output_dtype:
             return False
 
-        if config.input_dtype != torch.float16 and config.input_dtype != torch.bfloat16:
+        if config.input_dtype != torch.float16 and config.input_dtype != torch.bfloat16 and config.input_dtype != torch.float32:
             return False
 
         if is_gated(config.activation):

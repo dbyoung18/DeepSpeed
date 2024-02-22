@@ -6,10 +6,11 @@
 from typing import Any, Dict, Optional
 
 import torch
-import intel_extension_for_pytorch
 from .common import attention_ref
 
 from deepspeed.accelerator import get_accelerator
+if get_accelerator().device_name() == "xpu":
+    import intel_extension_for_pytorch
 from ....allocator import empty_from
 from ....inference_utils import DtypeEnum
 from ....kernels.ragged_ops import (
@@ -51,7 +52,7 @@ class DSDenseBlockedAttention(DSSelfAttentionBase):
         if config.input_dtype != config.output_dtype:
             return False
 
-        if DtypeEnum(config.input_dtype) not in (DtypeEnum.fp16, DtypeEnum.bf16):
+        if DtypeEnum(config.input_dtype) not in (DtypeEnum.fp16, DtypeEnum.bf16, DtypeEnum.fp32):
             return False
 
         if PositionalEmbeddingType(config.positional_embedding_type) not in [

@@ -16,3 +16,4 @@ from .mixtral import *
 from .falcon import *
 from .phi import *
 from .qwen import *
+from .gptj import *

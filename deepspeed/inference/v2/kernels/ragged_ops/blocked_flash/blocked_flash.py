@@ -67,7 +67,7 @@ class BlockedFlashAttn(DSKernelBase):
     range of input sequence lengths.
     """
 
-    supported_dtypes = [DtypeEnum.fp16, DtypeEnum.bf16]
+    supported_dtypes = [DtypeEnum.fp16, DtypeEnum.bf16, DtypeEnum.fp32]
 
     def __init__(self, head_size: int, dtype: DtypeEnum) -> None:
         """

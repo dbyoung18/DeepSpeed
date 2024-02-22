@@ -18,7 +18,7 @@ class CUDABiasActivation(DSKernelBase):
     we are fusing the bias activation into the linear kernel in all scenarios.
     """
 
-    supported_dtypes = [DtypeEnum.fp16, DtypeEnum.bf16]
+    supported_dtypes = [DtypeEnum.fp16, DtypeEnum.bf16, DtypeEnum.fp32]
     supported_act_fns = [ActivationType.IDENTITY, ActivationType.GELU, ActivationType.RELU, ActivationType.SILU]
 
     def __init__(self, channels: int, dtype: DtypeEnum, act_fn: ActivationType) -> None:
