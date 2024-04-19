@@ -95,7 +95,7 @@ class BlockedKVCache:
                 dist.all_reduce(dummy_tensor, op=ReduceOp.MIN, group=mp_group)
 
             get_accelerator().empty_cache()
-            available_kv_memory = get_accelerator().available_memory() - self._memory_config.size
+            available_kv_memory = get_accelerator().available_memory() * 0.9 - self._memory_config.size
             total_memory = get_accelerator().total_memory()
 
             inference_logger().debug(
@@ -107,9 +107,9 @@ class BlockedKVCache:
                     f"Insufficient memory to allocate KV-caches. Required: {total_per_block_footprint}, Available: {available_kv_memory}"
                 )
 
-            #num_blocks = available_kv_memory // total_per_block_footprint
+            num_blocks = int(available_kv_memory // total_per_block_footprint)
             # TODO: reduce memory usage
-            num_blocks = 1000
+            # num_blocks = 1000
 
             # In a multi-process setting, we need to ensure that all processes have the same
             # KV cache capacity to ensure scheduling guarantees are equivalent on all ranks.
