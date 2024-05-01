@@ -3,6 +3,8 @@
 
 # DeepSpeed Team
 
+import os
+
 from enum import Enum
 from typing import Tuple
 
@@ -136,19 +138,19 @@ class MemoryConfig(DeepSpeedConfigModel):
 
 class DSStateManagerConfig(DeepSpeedConfigModel):
 
-    max_tracked_sequences: PositiveInt = 24576
+    max_tracked_sequences: PositiveInt = 30000
     """
     How many sequences this engine will track simultaneously. This limit should be greater
     than the ``max_ragged_sequence_count``.
     """
 
-    max_ragged_batch_size: PositiveInt = 1024
+    max_ragged_batch_size: PositiveInt = int(os.environ.get("MAX_TOK", 1536))
     """
     The maximum number of tokens that can be contained in a single ragged batch. Passing
     a larger value than this will raise an exception that must be handled by the runtime.
     """
 
-    max_ragged_sequence_count: PositiveInt = 512
+    max_ragged_sequence_count: PositiveInt = int(os.environ.get("MAX_REQ", 1228))
     """
     The maximum number of sequences that can compose a batch. This limitation is only
     relevant under CUDA graphing scenarios currently, where the maximum number of blocks
@@ -156,7 +158,7 @@ class DSStateManagerConfig(DeepSpeedConfigModel):
     be larger than ``max_tracked_sequences`` or ``max_ragged_batch_size``.
     """
 
-    max_context: PositiveInt = 8192
+    max_context: PositiveInt = 2048
     """
     The maximum number of tokens (inclusive of generation) that can be contained in a single
     sequence. Currently used to bound the size of the KV cache metadata.

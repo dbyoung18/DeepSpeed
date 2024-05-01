@@ -7,6 +7,7 @@ import operator
 from functools import reduce
 from typing import Any, Iterable, Optional, Tuple
 
+import os
 import torch
 
 import deepspeed.comm as dist
@@ -107,9 +108,8 @@ class BlockedKVCache:
                     f"Insufficient memory to allocate KV-caches. Required: {total_per_block_footprint}, Available: {available_kv_memory}"
                 )
 
-            num_blocks = 0.8 * available_kv_memory // total_per_block_footprint
-            # TODO: reduce memory usage
-            # num_blocks = 1000
+            block_ratio = float(os.environ.get("BLOCK_RATIO", 0.8))
+            num_blocks = int(available_kv_memory * block_ratio // total_per_block_footprint)
 
             # In a multi-process setting, we need to ensure that all processes have the same
             # KV cache capacity to ensure scheduling guarantees are equivalent on all ranks.
